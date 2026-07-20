@@ -1,6 +1,7 @@
 """
-MPSC Monitor + Auto PDF Downloader
-Monitors MPSC website, downloads new PDFs, sends to Telegram.
+MPSC Monitor - Today-First Download + Continuous Monitoring
+First run: Downloads ALL items from today
+Then: Monitors every 15 minutes for new items
 """
 
 import requests
@@ -8,8 +9,9 @@ import os
 import re
 import json
 import hashlib
-from datetime import datetime
-from urllib.parse import urljoin, urlparse
+import sys
+from datetime import datetime, date
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 
@@ -19,7 +21,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 STATE_FILE = "monitor_state.json"
 DOWNLOAD_FOLDER = "downloaded_pdfs"
 
-# Ensure download folder exists
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 MPSC_URLS = {
@@ -33,13 +34,32 @@ MPSC_URLS = {
     "announcements": "https://mpsc.gov.in/announcement_and_circular/4",
 }
 
-# ─── STATE MANAGEMENT ────────────────────────────────────
+TODAY = date.today().strftime("%Y-%m-%d")
+TODAY_PATTERNS = [
+    date.today().strftime("%d-%m-%Y"),      # 20-07-2026
+    date.today().strftime("%d/%m/%Y"),        # 20/07/2026
+    date.today().strftime("%d.%m.%Y"),        # 20.07.2026
+    date.today().strftime("%Y-%m-%d"),        # 2026-07-20
+    date.today().strftime("%Y/%m/%d"),        # 2026/07/20
+]
+
+
+# ─── STATE ──────────────────────────────────────────────
 
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
-    return {"seen": {}, "last_run": None, "downloaded_pdfs": {}}
+    return {
+        "seen": {},
+        "last_run": None,
+        "first_run_complete": False,
+        "today_downloaded": False,
+        "stats": {
+            "total_tracked": 0,
+            "total_downloaded": 0
+        }
+    }
 
 def save_state(state):
     state["last_run"] = datetime.now().isoformat()
@@ -48,8 +68,8 @@ def save_state(state):
 
 # ─── TELEGRAM ──────────────────────────────────────────
 
-def send_telegram_text(title, message, url):
-    """Send text notification to Telegram"""
+def send_telegram(title, message, url, pdf_path=None):
+    """Send text + optional PDF"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("  [!] Telegram not configured")
         return False
@@ -64,6 +84,7 @@ def send_telegram_text(title, message, url):
     """.strip()
     
     try:
+        # Send text
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             data={
@@ -74,106 +95,78 @@ def send_telegram_text(title, message, url):
             },
             timeout=10
         )
-        return resp.status_code == 200
-    except Exception as e:
-        print(f"  [!] Telegram text error: {e}")
-        return False
-
-
-def send_telegram_pdf(filepath, caption, url):
-    """Send PDF file to Telegram"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("  [!] Telegram not configured")
-        return False
-    
-    if not os.path.exists(filepath):
-        print(f"  [!] File not found: {filepath}")
-        return False
-    
-    try:
-        with open(filepath, 'rb') as f:
-            resp = requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
-                data={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "caption": caption,
-                    "parse_mode": "HTML"
-                },
-                files={"document": f},
-                timeout=60
-            )
         
-        if resp.status_code == 200:
-            print(f"  [OK] PDF sent to Telegram")
-            return True
-        else:
-            print(f"  [!] Telegram PDF error: {resp.status_code}")
-            print(f"      {resp.text[:200]}")
-            return False
-            
-    except Exception as e:
-        print(f"  [!] Telegram PDF error: {e}")
-        return False
-
-
-def send_telegram_photo(image_path, caption):
-    """Send image/screenshot to Telegram"""
-    if not os.path.exists(image_path):
-        return False
-    
-    try:
-        with open(image_path, 'rb') as f:
-            resp = requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                data={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "caption": caption,
-                    "parse_mode": "HTML"
-                },
-                files={"photo": f},
-                timeout=30
-            )
+        # Send PDF if provided
+        if pdf_path and os.path.exists(pdf_path):
+            with open(pdf_path, 'rb') as f:
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                    data={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "caption": f"📄 {title[:80]}",
+                        "parse_mode": "HTML"
+                    },
+                    files={"document": f},
+                    timeout=60
+                )
+        
         return resp.status_code == 200
     except Exception as e:
-        print(f"  [!] Photo send error: {e}")
+        print(f"  [!] Telegram error: {e}")
         return False
+
+# ─── DATE CHECKER ──────────────────────────────────────
+
+def is_from_today(text, url=""):
+    """Check if text or URL contains today's date"""
+    combined = f"{text} {url}".lower()
+    for pattern in TODAY_PATTERNS:
+        if pattern.lower() in combined:
+            return True
+    return False
+
+def extract_date(text):
+    """Extract date from text, return None if not found"""
+    patterns = [
+        r'(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})',
+        r'(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            groups = match.groups()
+            if len(groups[0]) == 4:
+                return f"{groups[0]}-{groups[1].zfill(2)}-{groups[2].zfill(2)}"
+            else:
+                return f"{groups[2]}-{groups[1].zfill(2)}-{groups[0].zfill(2)}"
+    return None
 
 # ─── PDF DOWNLOADER ─────────────────────────────────────
 
 def download_pdf(pdf_url, title, section):
-    """Download PDF and save to organized folder"""
+    """Download PDF and return filepath"""
     if not pdf_url or '.pdf' not in pdf_url.lower():
-        print(f"  [SKIP] Not a PDF URL: {pdf_url[:60]}")
         return None
     
-    # Create safe filename
     safe_title = re.sub(r'[<>:"/\\|?*]', '', title)
     safe_title = re.sub(r'\s+', '_', safe_title.strip())[:80]
     
-    # Parse date from URL or title
     date_match = re.search(r'(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})', title + pdf_url)
     if date_match:
         date_str = f"{date_match.group(3)}-{date_match.group(2).zfill(2)}-{date_match.group(1).zfill(2)}"
     else:
-        date_str = datetime.now().strftime("%Y-%m-%d")
+        date_str = TODAY
     
-    # Organized path: downloaded_pdfs/section/YYYY-MM/filename.pdf
-    year_month = date_str[:7]  # YYYY-MM
+    year_month = date_str[:7]
     section_folder = os.path.join(DOWNLOAD_FOLDER, section, year_month)
     os.makedirs(section_folder, exist_ok=True)
     
-    # Unique filename
     url_hash = hashlib.md5(pdf_url.encode()).hexdigest()[:6]
     filename = f"{date_str}_{safe_title}_{url_hash}.pdf"
     filepath = os.path.join(section_folder, filename)
     
-    # Skip if already downloaded
     if os.path.exists(filepath):
-        print(f"  [SKIP] Already downloaded: {filename}")
         return filepath
-    
-    print(f"  [DOWNLOAD] {filename}")
-    print(f"      From: {pdf_url[:80]}...")
     
     try:
         session = requests.Session()
@@ -182,61 +175,27 @@ def download_pdf(pdf_url, title, section):
             'Accept': 'application/pdf,*/*;q=0.8',
         })
         
-        # Follow redirects, handle SSL
-        response = session.get(
-            pdf_url,
-            timeout=45,
-            stream=True,
-            allow_redirects=True,
-            verify=False
-        )
+        response = session.get(pdf_url, timeout=45, stream=True, allow_redirects=True, verify=False)
         response.raise_for_status()
         
-        # Verify it's actually a PDF
-        content_type = response.headers.get('Content-Type', '').lower()
-        content_length = response.headers.get('Content-Length', '0')
-        
-        # Check if HTML masquerading as PDF
-        if 'text/html' in content_type:
-            # Try to find actual PDF in response
+        # Check for HTML masquerading
+        if 'text/html' in response.headers.get('Content-Type', ''):
             first_chunk = next(response.iter_content(1024))
-            if b'%PDF' not in first_chunk and b'<html' in first_chunk:
-                print(f"  [WARN] Got HTML instead of PDF, trying to resolve...")
-                
-                # Re-fetch as normal GET
-                response = session.get(pdf_url, timeout=30, verify=False)
-                soup = BeautifulSoup(response.text, 'html.parser')
-                
-                # Look for actual PDF link
-                for link in soup.find_all('a', href=True):
-                    if '.pdf' in link['href'].lower():
-                        actual_url = urljoin(pdf_url, link['href'])
-                        print(f"  [RETRY] Found actual PDF: {actual_url[:80]}")
-                        return download_pdf(actual_url, title, section)
-                
-                print(f"  [FAIL] Could not resolve PDF")
+            if b'%PDF' not in first_chunk:
                 return None
         
-        # Stream download
         with open(filepath, 'wb') as f:
-            downloaded = 0
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
-                    downloaded += len(chunk)
         
-        # Verify file
         file_size = os.path.getsize(filepath)
         if file_size < 1024:
-            print(f"  [FAIL] File too small ({file_size} bytes)")
             os.remove(filepath)
             return None
         
-        # Verify PDF header
         with open(filepath, 'rb') as f:
-            header = f.read(10)
-            if not header.startswith(b'%PDF'):
-                print(f"  [FAIL] Not a valid PDF (header: {header[:5]})")
+            if not f.read(10).startswith(b'%PDF'):
                 os.remove(filepath)
                 return None
         
@@ -244,14 +203,13 @@ def download_pdf(pdf_url, title, section):
         return filepath
         
     except Exception as e:
-        print(f"  [FAIL] Download error: {str(e)[:80]}")
+        print(f"  [FAIL] Download error: {str(e)[:60]}")
         if os.path.exists(filepath):
             os.remove(filepath)
         return None
 
-
 def resolve_pdf_url(url):
-    """Resolve intermediate pages to get actual PDF URL"""
+    """Resolve to actual PDF URL"""
     if '.pdf' in url.lower():
         return url
     
@@ -259,41 +217,28 @@ def resolve_pdf_url(url):
         session = requests.Session()
         response = session.get(url, timeout=15, verify=False, allow_redirects=True)
         
-        # If redirect landed on PDF
         if '.pdf' in response.url.lower():
             return response.url
         
-        # If HTML page, parse for PDF
         if 'text/html' in response.headers.get('Content-Type', ''):
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # Meta refresh
             meta = soup.find('meta', attrs={'http-equiv': 'refresh'})
             if meta:
                 content = meta.get('content', '')
-                url_match = re.search(r'url=(.+)', content, re.IGNORECASE)
-                if url_match:
-                    redirect = url_match.group(1).strip()
-                    return resolve_pdf_url(urljoin(url, redirect))
+                match = re.search(r'url=(.+)', content, re.IGNORECASE)
+                if match:
+                    return resolve_pdf_url(urljoin(url, match.group(1).strip()))
             
-            # Find PDF link
             for link in soup.find_all('a', href=True):
-                href = link['href']
-                if '.pdf' in href.lower():
-                    return urljoin(url, href)
-            
-            # iframe/embed
-            for embed in soup.find_all(['iframe', 'embed'], src=True):
-                if '.pdf' in embed['src'].lower():
-                    return urljoin(url, embed['src'])
+                if '.pdf' in link['href'].lower():
+                    return urljoin(url, link['href'])
         
         return response.url
-        
-    except Exception as e:
-        print(f"  [WARN] Could not resolve URL: {e}")
+    except:
         return url
 
-# ─── WEB SCRAPER ─────────────────────────────────────────
+# ─── WEB SCRAPER ───────────────────────────────────────
 
 def fetch_page(url):
     try:
@@ -312,7 +257,6 @@ def fetch_page(url):
         print(f"  [!] Fetch failed: {e}")
         return None
 
-
 def extract_items(html, section_name):
     if not html:
         return []
@@ -329,16 +273,16 @@ def extract_items(html, section_name):
             
             title = ""
             url = ""
-            date_str = datetime.now().strftime("%Y-%m-%d")
+            date_str = TODAY
             is_pdf = False
             
             for cell in cells:
                 text = cell.get_text(strip=True)
                 if text and not title and text not in ['', 'View', 'Download', 'PDF']:
                     title = text
-                    m = re.search(r'(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})', text)
-                    if m:
-                        date_str = f"{m.group(3)}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}"
+                    extracted = extract_date(text)
+                    if extracted:
+                        date_str = extracted
                 
                 link = cell.find('a', href=True)
                 if link:
@@ -356,7 +300,8 @@ def extract_items(html, section_name):
                     "date": date_str,
                     "hash": item_hash,
                     "section": section_name,
-                    "is_pdf": is_pdf
+                    "is_pdf": is_pdf,
+                    "is_from_today": is_from_today(title, url)
                 })
     
     # Strategy 2: Direct PDF links
@@ -364,50 +309,76 @@ def extract_items(html, section_name):
         href = link['href']
         if '.pdf' in href.lower():
             full_url = urljoin("https://mpsc.gov.in", href)
-            title = link.get_text(strip=True) or "PDF Document"
+            title = link.get_text(strip=True) or "PDF"
             
             if not any(i["url"] == full_url for i in items):
                 item_hash = hashlib.sha256(f"{title}|{full_url}".encode()).hexdigest()[:16]
                 items.append({
                     "title": title,
                     "url": full_url,
-                    "date": datetime.now().strftime("%Y-%m-%d"),
+                    "date": TODAY,
                     "hash": item_hash,
                     "section": section_name,
-                    "is_pdf": True
-                })
-    
-    # Strategy 3: Links that might lead to PDFs
-    for link in soup.find_all('a', href=True):
-        href = link['href']
-        text = link.get_text(strip=True).lower()
-        if 'download' in text or 'view' in text:
-            full_url = urljoin("https://mpsc.gov.in", href)
-            if not any(i["url"] == full_url for i in items):
-                title = link.get_text(strip=True) or "Document"
-                item_hash = hashlib.sha256(f"{title}|{full_url}".encode()).hexdigest()[:16]
-                items.append({
-                    "title": title,
-                    "url": full_url,
-                    "date": datetime.now().strftime("%Y-%m-%d"),
-                    "hash": item_hash,
-                    "section": section_name,
-                    "is_pdf": False  # Will be resolved later
+                    "is_pdf": True,
+                    "is_from_today": is_from_today(title, full_url)
                 })
     
     return items
 
-# ─── MAIN ────────────────────────────────────────────────
+# ─── MAIN LOGIC ────────────────────────────────────────
 
-def main():
+def process_item(item, state, is_first_run=False):
+    """Process a single item - download, notify, track"""
+    if item["hash"] in state["seen"]:
+        print(f"  [SEEN] {item['title'][:60]}")
+        return False
+    
+    print(f"\n  [NEW] {item['title'][:60]}")
+    print(f"      Date: {item['date']} | Today: {item.get('is_from_today', False)}")
+    
+    # Track it
+    state["seen"][item["hash"]] = {
+        "title": item["title"],
+        "url": item["url"],
+        "date": item["date"],
+        "section": item["section"],
+        "first_seen": datetime.now().isoformat(),
+        "pdf_downloaded": False
+    }
+    
+    # Resolve PDF URL
+    pdf_url = resolve_pdf_url(item["url"])
+    filepath = None
+    
+    if '.pdf' in pdf_url.lower():
+        print(f"  [PDF] Downloading...")
+        filepath = download_pdf(pdf_url, item["title"], item["section"])
+        if filepath:
+            state["seen"][item["hash"]]["pdf_downloaded"] = True
+            state["stats"]["total_downloaded"] += 1
+    
+    # Send notification
+    notify_title = f"[{item['section']}] {item['title'][:80]}"
+    notify_body = f"Date: {item['date']}\nSection: {item['section']}"
+    
+    if is_first_run:
+        notify_title = f"📥 TODAY'S ITEM: {notify_title}"
+    else:
+        notify_title = f"🚨 NEW: {notify_title}"
+    
+    send_telegram(notify_title, notify_body, item["url"], filepath)
+    
+    return True
+
+def run_first_time(state):
+    """First run: Download ALL items from today"""
     print("=" * 60)
-    print("MPSC Monitor + Auto PDF Downloader")
+    print("FIRST RUN - DOWNLOADING ALL TODAY'S ITEMS")
+    print(f"Date: {TODAY}")
     print("=" * 60)
     
-    state = load_state()
-    new_items = []
-    total_checked = 0
-    pdfs_downloaded = 0
+    today_items = []
+    all_items = []
     
     for section_name, url in MPSC_URLS.items():
         print(f"\n[CHECK] {section_name}")
@@ -415,72 +386,105 @@ def main():
         
         html = fetch_page(url)
         items = extract_items(html, section_name)
-        total_checked += len(items)
+        all_items.extend(items)
+        
+        # Filter today's items
+        section_today = [i for i in items if i.get("is_from_today", False)]
+        today_items.extend(section_today)
+        
+        print(f"  Total items: {len(items)}")
+        print(f"  Today's items: {len(section_today)}")
+    
+    print(f"\n{'='*60}")
+    print(f"FOUND {len(today_items)} ITEMS FROM TODAY")
+    print(f"Total items on all pages: {len(all_items)}")
+    print(f"{'='*60}")
+    
+    # Process today's items
+    new_count = 0
+    for item in today_items:
+        if process_item(item, state, is_first_run=True):
+            new_count += 1
+    
+    # Also process non-today items (mark as seen, don't notify)
+    print(f"\n[MARKING] {len(all_items) - len(today_items)} older items as seen...")
+    for item in all_items:
+        if item["hash"] not in state["seen"]:
+            state["seen"][item["hash"]] = {
+                "title": item["title"],
+                "url": item["url"],
+                "date": item["date"],
+                "section": item["section"],
+                "first_seen": datetime.now().isoformat(),
+                "pdf_downloaded": False,
+                "skipped": True
+            }
+    
+    state["first_run_complete"] = True
+    state["today_downloaded"] = True
+    
+    print(f"\n{'='*60}")
+    print("FIRST RUN COMPLETE")
+    print(f"{'='*60}")
+    print(f"  Today's items downloaded: {new_count}")
+    print(f"  Total items now tracked: {len(state['seen'])}")
+    print(f"  Next run will only alert for NEW items")
+    print(f"{'='*60}")
+    
+    return new_count
+
+def run_monitor(state):
+    """Regular run: Only check for new items"""
+    print("=" * 60)
+    print("MONITOR RUN - CHECKING FOR NEW ITEMS")
+    print(f"Last run: {state.get('last_run', 'Never')}")
+    print("=" * 60)
+    
+    new_count = 0
+    
+    for section_name, url in MPSC_URLS.items():
+        print(f"\n[CHECK] {section_name}")
+        
+        html = fetch_page(url)
+        items = extract_items(html, section_name)
         
         for item in items:
-            if item["hash"] not in state["seen"]:
-                print(f"\n  [NEW] {item['title'][:60]}")
-                state["seen"][item["hash"]] = {
-                    "title": item["title"],
-                    "url": item["url"],
-                    "date": item["date"],
-                    "section": section_name,
-                    "first_seen": datetime.now().isoformat(),
-                    "pdf_downloaded": False
-                }
-                new_items.append(item)
-                
-                # Send text notification
-                send_telegram_text(
-                    f"[{section_name}] {item['title'][:80]}",
-                    f"Date: {item['date']}\nSection: {section_name}",
-                    item["url"]
-                )
-                
-                # If PDF, download and send
-                if item.get("is_pdf") or True:  # Try all links
-                    pdf_url = resolve_pdf_url(item["url"])
-                    
-                    if pdf_url and '.pdf' in pdf_url.lower():
-                        print(f"  [PDF] Resolving: {pdf_url[:80]}...")
-                        filepath = download_pdf(pdf_url, item["title"], section_name)
-                        
-                        if filepath:
-                            # Send PDF to Telegram
-                            caption = f"""
-📄 <b>{item['title'][:100]}</b>
-
-Section: {section_name}
-Date: {item['date']}
-
-✅ Auto-downloaded and sent
-                            """.strip()
-                            
-                            send_telegram_pdf(filepath, caption, item["url"])
-                            state["seen"][item["hash"]]["pdf_downloaded"] = True
-                            pdfs_downloaded += 1
-                    else:
-                        print(f"  [INFO] Not a PDF link, skipping download")
-                
-            else:
-                print(f"  [SEEN] {item['title'][:60]}")
+            if process_item(item, state, is_first_run=False):
+                new_count += 1
     
+    return new_count
+
+def main():
+    print("=" * 60)
+    print("MPSC Monitor - Today-First + Continuous")
+    print("=" * 60)
+    
+    state = load_state()
+    
+    # Determine mode
+    if not state.get("first_run_complete", False):
+        # First run - download all today's items
+        run_first_time(state)
+    else:
+        # Regular monitoring run
+        new_count = run_monitor(state)
+        
+        if new_count > 0:
+            print(f"\n🎉 Found {new_count} NEW items!")
+        else:
+            print("\n✅ No new items since last check.")
+    
+    # Save state
     save_state(state)
     
-    # Summary
+    # Final stats
     print(f"\n{'='*60}")
-    print("SUMMARY")
+    print("STATS")
     print(f"{'='*60}")
-    print(f"  Total checked: {total_checked}")
-    print(f"  New items: {len(new_items)}")
-    print(f"  PDFs downloaded: {pdfs_downloaded}")
     print(f"  Total tracked: {len(state['seen'])}")
+    print(f"  Total PDFs downloaded: {state['stats'].get('total_downloaded', 0)}")
+    print(f"  First run complete: {state.get('first_run_complete', False)}")
     print(f"{'='*60}")
-    
-    if new_items:
-        print(f"\nFound {len(new_items)} new items!")
-        if pdfs_downloaded > 0:
-            print(f"Downloaded and sent {pdfs_downloaded} PDFs to Telegram")
 
 if __name__ == "__main__":
     main()
