@@ -26,7 +26,6 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor.py
-        continue-on-error: true  # Never fail the workflow
       
       - name: Save state
         if: always()
@@ -35,4 +34,4 @@ jobs:
           git config --local user.name "GitHub Action"
           git add monitor_state.json downloaded_pdfs/ 2>/dev/null || true
           git diff --staged --quiet || git commit -m "Update: $(date +%Y-%m-%d-%H:%M)"
-          git push || echo "Push skipped"
+          git push || echo "Nothing to push"
