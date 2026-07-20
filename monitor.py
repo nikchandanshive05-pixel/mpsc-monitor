@@ -1,6 +1,6 @@
 """
-MPSC Monitor - Playwright Browser Version
-Uses real Chrome browser to bypass blocking.
+MPSC Monitor - Smart Filter
+Only captures actual notification/content links, ignores navigation.
 """
 
 import asyncio
@@ -26,12 +26,47 @@ MPSC_URLS = {
     "answer_keys": "https://mpsc.gov.in/answer_keys_of_examinations/45",
     "results": "https://mpsc.gov.in/result_of_exam/11",
     "question_papers": "https://mpsc.gov.in/prev_que_papers/9",
-    "provisional": "https://mpsc.gov.in/provisional_selection_list/12",
-    "merit": "https://mpsc.gov.in/results_merit_list/14",
     "schedule": "https://mpsc.gov.in/tentative_schedule_for_competitive_exam/19",
     "announcements": "https://mpsc.gov.in/announcement_and_circular/4",
 }
 
+
+# ─── BLOCKED KEYWORDS ───────────────────────────────────
+
+# Skip these — they are navigation, not content
+BLOCKED_TEXT = [
+    'home', 'next', 'previous', 'prev', 'disclaimer', 'copyright',
+    'privacy policy', 'terms', 'contact us', 'about us', 'sitemap',
+    'skip to content', 'screen reader', 'accessibility', 'login',
+    'logout', 'register', 'search', 'submit', 'reset', 'back',
+    'click here', 'read more', 'learn more', 'details', 'view all',
+    'archive', 'older posts', 'newer posts', 'first', 'last',
+    'print', 'share', 'bookmark', 'rss', 'subscribe', 'follow',
+    'facebook', 'twitter', 'youtube', 'instagram', 'linkedin',
+    'whatsapp', 'telegram', 'email', 'phone', 'fax',
+    'rti', 'site map', 'hyperlinking policy', 'terms of use',
+    'website policies', 'help', 'faq', 'feedback', 'complaint',
+    'tender', 'recruitment', 'career', 'vacancy', 'apply',
+]
+
+BLOCKED_URL_PATTERNS = [
+    r'javascript:',
+    r'mailto:',
+    r'tel:',
+    r'facebook\.com',
+    r'twitter\.com',
+    r'youtube\.com',
+    r'instagram\.com',
+    r'linkedin\.com',
+    r'whatsapp\.com',
+    r't\.me',
+    r'/#',
+    r'#$',
+    r'\?page=\d+',  # pagination like ?page=2
+    r'/page/\d+',   # pagination like /page/2
+]
+
+# ─── STATE ──────────────────────────────────────────────
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -70,49 +105,61 @@ def send_telegram(title, message, url):
         print(f"  [!] Telegram: {e}")
         return False
 
-def download_pdf(pdf_url, title, section):
-    if not pdf_url or '.pdf' not in pdf_url.lower():
-        return None
-    
-    try:
-        safe_title = re.sub(r'[^\w\s-]', '', str(title)).strip()[:50]
-        safe_title = re.sub(r'\s+', '_', safe_title)
-        
-        section_folder = os.path.join(DOWNLOAD_FOLDER, section, TODAY[:7])
-        os.makedirs(section_folder, exist_ok=True)
-        
-        url_hash = hashlib.md5(pdf_url.encode()).hexdigest()[:6]
-        filename = f"{TODAY}_{safe_title}_{url_hash}.pdf"
-        filepath = os.path.join(section_folder, filename)
-        
-        if os.path.exists(filepath):
-            return filepath
-        
-        print(f"  [DOWNLOAD] {filename[:80]}")
-        
-        resp = requests.get(pdf_url, timeout=30, stream=True, verify=False)
-        resp.raise_for_status()
-        
-        with open(filepath, 'wb') as f:
-            for chunk in resp.iter_content(8192):
-                if chunk:
-                    f.write(chunk)
-        
-        size = os.path.getsize(filepath)
-        if size < 1024:
-            os.remove(filepath)
-            return None
-        
-        print(f"  [OK] {size/1024:.0f} KB")
-        return filepath
-        
-    except Exception as e:
-        print(f"  [FAIL] {str(e)[:60]}")
-        return None
+# ─── SMART FILTER ───────────────────────────────────────
 
+def is_valid_content(text, url):
+    """Check if this is actual content, not navigation"""
+    if not text or not url:
+        return False
+    
+    text_lower = text.lower().strip()
+    url_lower = url.lower().strip()
+    
+    # Must have meaningful text
+    if len(text) < 10:
+        return False
+    
+    # Skip blocked text
+    for blocked in BLOCKED_TEXT:
+        if blocked in text_lower:
+            print(f"    [FILTER] Blocked text: '{blocked}' in '{text[:40]}'")
+            return False
+    
+    # Skip blocked URL patterns
+    for pattern in BLOCKED_URL_PATTERNS:
+        if re.search(pattern, url_lower):
+            print(f"    [FILTER] Blocked URL pattern: {pattern}")
+            return False
+    
+    # Must look like a document/notification
+    # Should have some meaningful content indicators
+    content_indicators = [
+        'notification', 'advertisement', 'result', 'answer key',
+        'question paper', 'schedule', 'syllabus', 'exam', 'recruitment',
+        'pdf', 'download', 'circular', 'order', 'letter', 'memo',
+        '2024', '2025', '2026', 'march', 'april', 'may', 'june', 'july',
+        'august', 'september', 'october', 'november', 'december',
+        'january', 'february', 'group', 'post', 'vacancy',
+        'preliminary', 'mains', 'interview', 'selection', 'merit',
+        'list', 'final', 'provisional', 'tentative', 'scheme',
+    ]
+    
+    has_indicator = any(ind in text_lower for ind in content_indicators)
+    
+    if not has_indicator:
+        print(f"    [FILTER] No content indicator in: '{text[:50]}'")
+        return False
+    
+    # Must be from mpsc.gov.in domain (or resolved to it)
+    if 'mpsc.gov.in' not in url_lower and not url_lower.startswith('/'):
+        # Could be relative URL, allow it
+        pass
+    
+    return True
+
+# ─── MAIN SCRAPER ───────────────────────────────────────
 
 async def scrape_page(browser, section_name, url):
-    """Scrape a single page with Playwright"""
     print(f"\n[CHECK] {section_name}")
     print(f"  URL: {url}")
     
@@ -121,134 +168,93 @@ async def scrape_page(browser, section_name, url):
     
     try:
         context = await browser.new_context(
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.0',
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             viewport={'width': 1920, 'height': 1080},
-            java_script_enabled=True,
         )
         
         page = await context.new_page()
         
-        # Navigate with longer timeout
-        print(f"  [BROWSER] Loading page...")
+        print(f"  [BROWSER] Loading...")
         response = await page.goto(url, wait_until='networkidle', timeout=60000)
         
         if not response:
-            print(f"  [ERROR] No response from page")
+            print(f"  [ERROR] No response")
             return items
         
         print(f"  [BROWSER] HTTP {response.status}")
-        print(f"  [BROWSER] Waiting for content...")
-        
-        # Wait for page to fully render
         await page.wait_for_timeout(5000)
         
-        # Get page content
-        content = await page.content()
-        print(f"  [BROWSER] Content length: {len(content)} bytes")
-        
-        # Extract all links using page.evaluate (JavaScript execution)
-        print(f"  [BROWSER] Extracting links via JavaScript...")
+        # Extract links with smart filtering
+        print(f"  [BROWSER] Extracting content links...")
         
         links = await page.evaluate("""
             () => {
                 const results = [];
                 const allLinks = document.querySelectorAll('a');
+                
                 allLinks.forEach(link => {
                     const href = link.href || link.getAttribute('href') || '';
-                    const text = link.innerText || link.textContent || '';
-                    if (href && href.length > 1 && href !== '#') {
-                        results.push({
-                            href: href,
-                            text: text.trim().substring(0, 200),
-                            isPDF: href.toLowerCase().includes('.pdf')
-                        });
+                    const text = (link.innerText || link.textContent || '').trim();
+                    
+                    // Skip empty or hash-only links
+                    if (!href || href === '#' || href === 'javascript:void(0)') {
+                        return;
                     }
+                    
+                    // Skip navigation elements
+                    const parent = link.closest('nav, header, footer, .pagination, .menu, .sidebar');
+                    if (parent) {
+                        return; // Skip nav/header/footer links
+                    }
+                    
+                    // Skip if inside pagination
+                    if (link.closest('.pagination, .pager, .page-nav, nav[role="navigation"]')) {
+                        return;
+                    }
+                    
+                    results.push({
+                        href: href,
+                        text: text.substring(0, 300),
+                        isPDF: href.toLowerCase().includes('.pdf'),
+                        hasDate: /\\d{1,2}[-/.]\\d{1,2}[-/.]\\d{2,4}/.test(text)
+                    });
                 });
+                
                 return results;
             }
         """)
         
-        print(f"  [BROWSER] Found {len(links)} links via JS")
+        print(f"  [BROWSER] Raw links: {len(links)}")
         
-        # Also extract from onclick handlers
-        onclick_links = await page.evaluate("""
-            () => {
-                const results = [];
-                const allElements = document.querySelectorAll('*');
-                allElements.forEach(el => {
-                    const onclick = el.getAttribute('onclick');
-                    if (onclick) {
-                        const matches = onclick.match(/["'](https?:\\/\\/[^"']+)["']/g);
-                        if (matches) {
-                            matches.forEach(m => {
-                                const url = m.replace(/["']/g, '');
-                                results.push({
-                                    href: url,
-                                    text: el.innerText || 'Onclick link',
-                                    isPDF: url.toLowerCase().includes('.pdf')
-                                });
-                            });
-                        }
-                    }
-                });
-                return results;
-            }
-        """)
-        
-        print(f"  [BROWSER] Found {len(onclick_links)} onclick links")
-        
-        all_links = links + onclick_links
-        
-        # Process links
-        for link in all_links:
-            try:
-                href = link.get('href', '') or link.get('url', '')
-                text = link.get('text', '') or link.get('title', 'Document')
-                
-                if not href or href in ['#', '', 'javascript:void(0)']:
-                    continue
-                
-                # Skip navigation links
-                skip_patterns = ['home', 'about', 'contact', 'login', 'logout', 'facebook', 'twitter', 'youtube']
-                if any(p in href.lower() for p in skip_patterns):
-                    continue
-                
-                if len(text) < 2:
-                    continue
-                
+        # Apply smart filter
+        valid_items = []
+        for link in links:
+            text = link.get('text', '')
+            href = link.get('href', '')
+            
+            if is_valid_content(text, href):
                 item_hash = hashlib.sha256(f"{text}|{href}".encode()).hexdigest()[:16]
                 
-                items.append({
+                valid_items.append({
                     "title": text[:200],
                     "url": href[:500],
                     "date": TODAY,
                     "hash": item_hash,
                     "section": section_name,
-                    "is_pdf": link.get('isPDF', False) or '.pdf' in href.lower()
+                    "is_pdf": link.get('isPDF', False),
+                    "has_date": link.get('hasDate', False)
                 })
-                
-            except Exception as e:
-                continue
         
-        # Deduplicate
-        seen = set()
-        unique_items = []
-        for item in items:
-            if item['hash'] not in seen:
-                seen.add(item['hash'])
-                unique_items.append(item)
+        print(f"  [BROWSER] Valid content items: {len(valid_items)}")
         
-        print(f"  [BROWSER] Unique items: {len(unique_items)}")
-        
-        # Show sample
-        if unique_items:
-            print(f"  [SAMPLE] First 3:")
-            for i, item in enumerate(unique_items[:3], 1):
-                print(f"    {i}. {item['title'][:50]}...")
-                print(f"       PDF: {item['is_pdf']} | {item['url'][:60]}...")
+        if valid_items:
+            print(f"  [SAMPLE] First 3 valid items:")
+            for i, item in enumerate(valid_items[:3], 1):
+                print(f"    {i}. {item['title'][:60]}")
+                print(f"       PDF: {item['is_pdf']} | Date: {item['has_date']}")
         
         await context.close()
-        return unique_items
+        return valid_items
         
     except Exception as e:
         print(f"  [ERROR] {str(e)[:100]}")
@@ -262,24 +268,19 @@ async def scrape_page(browser, section_name, url):
 
 async def main():
     print("=" * 60)
-    print("MPSC Monitor - Playwright Browser")
+    print("MPSC Monitor - Smart Filter")
     print(f"Date: {TODAY}")
     print("=" * 60)
     
-    if not TELEGRAM_BOT_TOKEN:
-        print("[ERROR] TELEGRAM_BOT_TOKEN missing")
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[ERROR] Telegram not configured")
         return 0
-    if not TELEGRAM_CHAT_ID:
-        print("[ERROR] TELEGRAM_CHAT_ID missing")
-        return 0
-    
-    print(f"[OK] Telegram configured")
     
     state = load_state()
     total_new = 0
     
     async with async_playwright() as p:
-        print("[BROWSER] Launching Chromium...")
+        print("[BROWSER] Launching...")
         
         browser = await p.chromium.launch(
             headless=True,
@@ -288,12 +289,10 @@ async def main():
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-gpu',
-                '--disable-web-security',
-                '--disable-features=IsolateOrigins,site-per-process',
             ]
         )
         
-        print(f"[BROWSER] Browser launched")
+        print("[BROWSER] Ready")
         
         for section_name, url in MPSC_URLS.items():
             items = await scrape_page(browser, section_name, url)
@@ -305,7 +304,6 @@ async def main():
                     continue
                 
                 print(f"\n  [NEW] {item['title'][:60]}")
-                print(f"       URL: {item['url'][:80]}")
                 
                 state["seen"][item["hash"]] = {
                     "title": item["title"],
@@ -315,13 +313,6 @@ async def main():
                     "first_seen": datetime.now().isoformat()
                 }
                 
-                # Download PDF
-                pdf_path = None
-                if item.get("is_pdf"):
-                    print(f"  [PDF] Downloading...")
-                    pdf_path = download_pdf(item["url"], item["title"], item["section"])
-                
-                # Notify
                 send_telegram(
                     f"[{item['section']}] {item['title'][:80]}",
                     f"Date: {item['date']}",
@@ -334,15 +325,11 @@ async def main():
             print(f"  [SECTION] New: {section_new}")
         
         await browser.close()
-        print("[BROWSER] Browser closed")
     
     save_state(state)
     
     print(f"\n{'='*60}")
-    print("FINAL SUMMARY")
-    print(f"{'='*60}")
-    print(f"  New items: {total_new}")
-    print(f"  Total tracked: {len(state.get('seen', {}))}")
+    print(f"New: {total_new} | Total: {len(state.get('seen', {}))}")
     print(f"{'='*60}")
     
     return 0
