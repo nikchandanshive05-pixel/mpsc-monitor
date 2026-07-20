@@ -1,8 +1,8 @@
-name: MPSC Monitor + PDF Downloader
+name: MPSC Monitor - Today First
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/15 * * * *'  # Every 15 minutes
   workflow_dispatch:
 
 jobs:
