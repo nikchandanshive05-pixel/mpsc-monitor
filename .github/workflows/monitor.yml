@@ -1,4 +1,4 @@
-name: MPSC Monitor
+name: MPSC Monitor + PDF Downloader
 
 on:
   schedule:
@@ -29,10 +29,10 @@ jobs:
         run: |
           python monitor.py
       
-      - name: Commit state changes
+      - name: Commit state and downloads
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add monitor_state.json
-          git diff --staged --quiet || git commit -m "Update monitor state"
+          git add monitor_state.json downloaded_pdfs/
+          git diff --staged --quiet || git commit -m "Update: $(date +%Y-%m-%d-%H:%M)"
           git push
