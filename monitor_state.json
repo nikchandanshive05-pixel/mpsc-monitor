@@ -1,4 +1,12 @@
 {
-  "seen": {},
-  "last_run": null
+  "seen": {
+    "c010a24dc772eeb9": {
+      "title": "IMPORTANT GOVT.ORDERS",
+      "url": "https://mpsc.gov.in/imp_gov_orders/2",
+      "date": "2026-07-20",
+      "section": "advertisements",
+      "first_seen": "2026-07-20T15:45:22.263322"
+    }
+  },
+  "last_run": "2026-07-20T15:46:13.948751"
 }
