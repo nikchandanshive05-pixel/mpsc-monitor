@@ -2,16 +2,20 @@ name: MPSC Monitor - Today First
 
 on:
   schedule:
-    - cron: '*/15 * * * *'  # Every 15 minutes
+    - cron: '*/15 * * * *'
   workflow_dispatch:
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # IMPORTANT: Allows pushing back to repo
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}  # Use built-in token
       
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -34,5 +38,11 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add monitor_state.json downloaded_pdfs/
-          git diff --staged --quiet || git commit -m "Update: $(date +%Y-%m-%d-%H:%M)"
-          git push
+          
+          # Only commit if there are changes
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update: $(date +%Y-%m-%d-%H:%M)"
+            git push
+          fi
