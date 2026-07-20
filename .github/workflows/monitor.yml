@@ -1,13 +1,14 @@
-name: MPSC Monitor
+name: MPSC Monitor - Browser
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/30 * * * *'  # Every 30 min (browser is slower)
   workflow_dispatch:
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     
     steps:
       - name: Checkout code
@@ -18,8 +19,17 @@ jobs:
         with:
           python-version: '3.11'
       
-      - name: Install dependencies
-        run: pip install requests beautifulsoup4
+      - name: Install Python dependencies
+        run: |
+          pip install playwright requests beautifulsoup4
+      
+      - name: Install Playwright browsers
+        run: |
+          playwright install chromium
+      
+      - name: Install system dependencies
+        run: |
+          playwright install-deps chromium
       
       - name: Run monitor
         env:
