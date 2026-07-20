@@ -19,28 +19,20 @@ jobs:
           python-version: '3.11'
       
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4
-      
-      - name: Check files exist
-        run: |
-          echo "Current directory: $(pwd)"
-          echo "Files:"
-          ls -la
-          echo "Checking monitor.py:"
-          python -c "import os; print('EXISTS' if os.path.exists('monitor.py') else 'MISSING')"
+        run: pip install requests beautifulsoup4
       
       - name: Run monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python monitor.py || echo "Monitor completed with warnings"
+        run: python monitor.py
+        continue-on-error: true  # Never fail the workflow
       
-      - name: Show state
+      - name: Save state
         if: always()
         run: |
-          echo "=== STATE FILE ==="
-          cat monitor_state.json 2>/dev/null || echo "No state file yet"
-          echo "=== DONE ==="
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add monitor_state.json downloaded_pdfs/ 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "Update: $(date +%Y-%m-%d-%H:%M)"
+          git push || echo "Push skipped"
